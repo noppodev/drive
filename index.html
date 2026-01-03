@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NoppoDrive - スマートストレージ</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, addDoc, deleteDoc, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Noppo Auth 設定 ---
+        const AUTH_WORKER_URL = "https://noppo-auth.noppo5319.workers.dev";
+        const SUPABASE_URL = "https://vvavasrdxguqkiigcxkl.supabase.co";
+        const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ2YXZhc3JkeGd1cWtpaWdjeGtsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc0MTk5ODcsImV4cCI6MjA4Mjk5NTk4N30.CVq3lyRbxek7Ejs4tP5sN9-0JNEXSLtCsC2Pj-skFFQ";
+
+        // --- Firebase 初期化 (安全策) ---
+        let app, auth, db, appId;
+        const initFirebase = async () => {
+            try {
+                const config = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+                if (!config) throw new Error("Firebase config missing");
+                
+                app = initializeApp(config);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                appId = typeof __app_id !== 'undefined' ? __app_id : 'noppo-drive-default';
+                return true;
+            } catch (e) {
+                console.error("Firebase connection failed. UI will run in restricted mode.", e);
+                return false;
+            }
+        };
+
+        // 状態管理
+        let files = [];
+        let isFirebaseReady = false;
+
+        // --- UI要素 ---
+        const authScreen = document.getElementById('auth-screen');
+        const appScreen = document.getElementById('app-screen');
+        const userNameDisplay = document.getElementById('user-name');
+        const fileList = document.getElementById('file-list');
+        const uploadForm = document.getElementById('upload-form');
+
+        // --- 認証ロジック ---
+        function goToLogin() {
+            const currentUrl = encodeURIComponent(window.location.href);
+            window.location.href = `${AUTH_WORKER_URL}?redirect=${currentUrl}`;
+        }
+
+        function checkUrlToken() {
+            const params = new URLSearchParams(window.location.search);
+            const token = params.get('token');
+            if (token) {
+                localStorage.setItem('noppo_token', token);
+                const cleanUrl = window.location.origin + window.location.pathname;
+                window.history.replaceState({}, document.title, cleanUrl);
+                return true;
+            }
+            return false;
+        }
+
+        async function fetchNoppoUser() {
+            const token = localStorage.getItem('noppo_token');
+            if (!token) return null;
+            try {
+                const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+                    headers: { "Authorization": `Bearer ${token}`, "apikey": SUPABASE_KEY }
+                });
+                if (response.ok) {
+                    const user = await response.json();
+                    return user.user_metadata.display_name || user.user_metadata.username || user.email;
+                }
+            } catch (e) { console.error(e); }
+            localStorage.removeItem('noppo_token');
+            return null;
+        }
+
+        function logout() {
+            localStorage.removeItem('noppo_token');
+            const currentUrl = encodeURIComponent(window.location.href);
+            window.location.href = `${AUTH_WORKER_URL}/logout?redirect=${currentUrl}`;
+        }
+
+        // --- メインアプリ制御 ---
+        async function startApp() {
+            isFirebaseReady = await initFirebase();
+            checkUrlToken();
+            const noppoUser = await fetchNoppoUser();
+
+            if (!noppoUser) {
+                authScreen.classList.remove('hidden');
+                appScreen.classList.add('hidden');
+            } else {
+                authScreen.classList.add('hidden');
+                appScreen.classList.remove('hidden');
+                userNameDisplay.innerText = noppoUser;
+                
+                if (isFirebaseReady) {
+                    // Firebase認証
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    
+                    // リアルタイム購読
+                    const q = collection(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'files');
+                    onSnapshot(q, (snapshot) => {
+                        files = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        renderFiles();
+                    }, (err) => {
+                        console.error(err);
+                        showError("データの読み込みに失敗しました。");
+                    });
+                } else {
+                    showError("Firebaseに接続できません。プレビュー環境の設定を確認してください。");
+                }
+            }
+            lucide.createIcons();
+        }
+
+        function renderFiles() {
+            if (files.length === 0) {
+                fileList.innerHTML = `
+                    <div class="flex flex-col items-center justify-center py-20 bg-white rounded-3xl border-2 border-dashed border-gray-100">
+                        <div class="p-4 bg-gray-50 rounded-full mb-4 text-gray-300">
+                            <i data-lucide="folder-open" class="w-12 h-12"></i>
+                        </div>
+                        <p class="text-gray-400 font-medium">まだファイルがありません</p>
+                        <p class="text-xs text-gray-300 mt-1">左側のパネルからリンクを追加しましょう</p>
+                    </div>`;
+            } else {
+                fileList.innerHTML = files.map(file => `
+                    <div class="group flex items-center justify-between p-4 bg-white rounded-2xl border border-gray-100 hover:border-blue-200 hover:shadow-xl hover:shadow-blue-500/5 transition-all duration-300">
+                        <div class="flex items-center gap-4 overflow-hidden">
+                            <div class="w-12 h-12 bg-blue-50 text-blue-600 rounded-xl flex items-center justify-center shrink-0 group-hover:bg-blue-600 group-hover:text-white transition-colors">
+                                <i data-lucide="link-2" class="w-6 h-6"></i>
+                            </div>
+                            <div class="truncate text-left">
+                                <h3 class="font-bold text-gray-800 truncate">${file.name}</h3>
+                                <p class="text-[10px] text-gray-400 font-mono truncate">${new URL(file.url).hostname}</p>
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <a href="${file.url}" target="_blank" class="p-2.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-xl transition-all" title="開く">
+                                <i data-lucide="external-link" class="w-5 h-5"></i>
+                            </a>
+                            <button onclick="window.deleteFile('${file.id}')" class="p-2.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all" title="削除">
+                                <i data-lucide="trash-2" class="w-5 h-5"></i>
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+            }
+            lucide.createIcons();
+        }
+
+        async function handleUpload(e) {
+            e.preventDefault();
+            const name = document.getElementById('input-name').value;
+            const url = document.getElementById('input-url').value;
+            
+            if (!isFirebaseReady || !auth.currentUser) return;
+
+            const btn = e.target.querySelector('button');
+            btn.disabled = true;
+            btn.innerText = "保存中...";
+
+            try {
+                await addDoc(collection(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'files'), {
+                    name, url, createdAt: serverTimestamp()
+                });
+                e.target.reset();
+            } catch (err) {
+                console.error(err);
+                alert("保存に失敗しました。");
+            } finally {
+                btn.disabled = false;
+                btn.innerText = "ドライブに追加";
+            }
+        }
+
+        window.deleteFile = async (id) => {
+            if (!confirm("このファイルを削除してもよろしいですか？")) return;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'files', id));
+            } catch (e) { console.error(e); }
+        };
+
+        function showError(msg) {
+            fileList.innerHTML = `<div class="p-8 bg-red-50 text-red-600 rounded-2xl border border-red-100 text-sm font-medium flex items-center gap-3">
+                <i data-lucide="alert-circle"></i> ${msg}
+            </div>`;
+            lucide.createIcons();
+        }
+
+        // イベント登録
+        document.getElementById('btn-login').addEventListener('click', goToLogin);
+        document.getElementById('btn-logout').addEventListener('click', logout);
+        uploadForm.addEventListener('submit', handleUpload);
+
+        window.onload = startApp;
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap');
+        body { font-family: 'Plus Jakarta Sans', sans-serif; letter-spacing: -0.01em; }
+        .hidden { display: none; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: #e5e7eb; border-radius: 10px; }
+    </style>
+</head>
+<body class="bg-[#F8FAFC] text-[#1E293B] min-h-screen">
+
+    <!-- ログイン画面 -->
+    <div id="auth-screen" class="hidden flex items-center justify-center min-h-screen p-6">
+        <div class="max-w-md w-full text-center">
+            <div class="mb-8 inline-flex p-5 bg-blue-600 text-white rounded-[2.5rem] shadow-2xl shadow-blue-200">
+                <i data-lucide="cloud-lightning" class="w-14 h-14"></i>
+            </div>
+            <h1 class="text-4xl font-extrabold mb-4 tracking-tight">NoppoDrive</h1>
+            <p class="text-gray-500 mb-10 text-lg">クラウド上のあらゆるリンクを、<br>一つのインテリジェントな場所へ。</p>
+            <button id="btn-login" class="group w-full py-5 bg-[#0F172A] hover:bg-blue-600 text-white rounded-2xl font-bold shadow-xl transition-all duration-300 flex items-center justify-center gap-3">
+                Noppoアカウントでログイン
+                <i data-lucide="arrow-right" class="w-5 h-5 group-hover:translate-x-1 transition-transform"></i>
+            </button>
+        </div>
+    </div>
+
+    <!-- メインアプリ画面 -->
+    <div id="app-screen" class="hidden flex flex-col h-screen">
+        <header class="bg-white/80 backdrop-blur-md border-b border-gray-100 px-6 sm:px-10 py-5 flex items-center justify-between sticky top-0 z-30">
+            <div class="flex items-center gap-3">
+                <div class="p-2.5 bg-blue-600 text-white rounded-xl">
+                    <i data-lucide="cloud" class="w-6 h-6"></i>
+                </div>
+                <span class="text-xl font-extrabold tracking-tighter">NoppoDrive</span>
+            </div>
+            
+            <div class="flex items-center gap-6">
+                <div class="hidden sm:flex flex-col items-end">
+                    <span id="user-name" class="text-sm font-bold text-gray-900 leading-none mb-1">...</span>
+                    <span class="text-[10px] text-blue-500 font-extrabold uppercase tracking-widest">Premium Plan</span>
+                </div>
+                <button id="btn-logout" class="p-2.5 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all">
+                    <i data-lucide="log-out" class="w-5 h-5"></i>
+                </button>
+            </div>
+        </header>
+
+        <div class="flex-1 flex flex-col lg:flex-row overflow-hidden">
+            <!-- アップロードサイドパネル -->
+            <aside class="w-full lg:w-96 bg-white border-r border-gray-100 p-8 flex-shrink-0 z-20">
+                <div class="mb-10">
+                    <div class="flex items-center gap-2 mb-6">
+                        <div class="w-1.5 h-6 bg-blue-600 rounded-full"></div>
+                        <h2 class="text-lg font-extrabold tracking-tight">クイック追加</h2>
+                    </div>
+                    <form id="upload-form" class="space-y-5">
+                        <div class="group">
+                            <label class="block text-[11px] font-black text-gray-400 uppercase tracking-widest mb-2 ml-1">ファイル名</label>
+                            <input id="input-name" type="text" placeholder="例: デザインガイドライン" class="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 focus:bg-white outline-none transition-all font-medium" required>
+                        </div>
+                        <div class="group">
+                            <label class="block text-[11px] font-black text-gray-400 uppercase tracking-widest mb-2 ml-1">リンク URL</label>
+                            <input id="input-url" type="url" placeholder="https://..." class="w-full px-5 py-4 bg-gray-50 border border-gray-100 rounded-2xl focus:ring-4 focus:ring-blue-500/10 focus:border-blue-500 focus:bg-white outline-none transition-all font-medium" required>
+                        </div>
+                        <button type="submit" class="w-full py-4.5 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl font-extrabold shadow-lg shadow-blue-200 transition-all active:scale-[0.98] mt-2">
+                            ドライブに追加
+                        </button>
+                    </form>
+                </div>
+
+                <div class="p-6 bg-slate-900 rounded-[2rem] text-white overflow-hidden relative">
+                    <i data-lucide="zap" class="absolute -right-4 -bottom-4 w-24 h-24 text-white/5 rotate-12"></i>
+                    <h3 class="text-sm font-bold mb-2 flex items-center gap-2">
+                        <span class="w-2 h-2 bg-blue-400 rounded-full"></span>
+                        Storage Tip
+                    </h3>
+                    <p class="text-xs text-slate-400 leading-relaxed">
+                        Googleドキュメント、Canva、GitHub、Notionなど、お気に入りのツールのURLをここに集約しましょう。
+                    </p>
+                </div>
+            </aside>
+
+            <!-- メインコンテンツ -->
+            <main class="flex-1 overflow-y-auto p-6 sm:p-12">
+                <div class="max-w-4xl mx-auto">
+                    <div class="flex items-center justify-between mb-10">
+                        <div>
+                            <h1 class="text-3xl font-black tracking-tight text-gray-900 mb-2">マイドライブ</h1>
+                            <p class="text-sm text-gray-400 font-medium">整理されたすべてのリンク</p>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <button class="w-10 h-10 flex items-center justify-center bg-white border border-gray-100 rounded-xl text-gray-400 hover:text-blue-600 transition-all shadow-sm">
+                                <i data-lucide="search" class="w-5 h-5"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div id="file-list" class="grid grid-cols-1 gap-4">
+                        <!-- Connecting Indicator -->
+                        <div class="flex flex-col items-center justify-center py-32">
+                            <div class="w-12 h-12 border-4 border-blue-100 border-t-blue-600 rounded-full animate-spin mb-6"></div>
+                            <p class="text-sm font-bold text-gray-400 tracking-widest uppercase animate-pulse">Connecting...</p>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+</body>
+</html>
