@@ -140,20 +140,33 @@
             class="context-menu" 
             :style="{ top: contextMenu.y + 'px', left: contextMenu.x + 'px' }">
             <template v-if="contextMenu.item">
-                <button @click="handleItemClick(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-slate-100 rounded-xl transition-colors text-sm font-bold text-slate-700">
-                    <i data-lucide="eye" class="w-4 h-4"></i> 表示
-                </button>
-                <button @click="toggleStar(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-slate-100 rounded-xl transition-colors text-sm font-bold text-slate-700">
-                    <i data-lucide="star" class="w-4 h-4" :class="contextMenu.item.is_starred ? 'text-amber-500 fill-amber-500' : ''"></i> 
-                    {{ contextMenu.item.is_starred ? 'お気に入り解除' : 'お気に入りに追加' }}
-                </button>
-                <button v-if="contextMenu.item.type !== 'folder'" @click="downloadFile(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-slate-100 rounded-xl transition-colors text-sm font-bold text-slate-700">
-                    <i data-lucide="download" class="w-4 h-4"></i> ダウンロード
-                </button>
-                <div class="h-px bg-slate-100 my-1"></div>
-                <button @click="moveToTrash(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-rose-50 rounded-xl transition-colors text-sm font-bold text-rose-500">
-                    <i data-lucide="trash-2" class="w-4 h-4"></i> 削除
-                </button>
+                <!-- ゴミ箱の中ではない場合 -->
+                <template v-if="!contextMenu.item.is_deleted">
+                    <button @click="handleItemClick(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-slate-100 rounded-xl transition-colors text-sm font-bold text-slate-700">
+                        <i data-lucide="eye" class="w-4 h-4"></i> 表示
+                    </button>
+                    <button @click="toggleStar(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-slate-100 rounded-xl transition-colors text-sm font-bold text-slate-700">
+                        <i data-lucide="star" class="w-4 h-4" :class="contextMenu.item.is_starred ? 'text-amber-500 fill-amber-500' : ''"></i> 
+                        {{ contextMenu.item.is_starred ? 'お気に入り解除' : 'お気に入りに追加' }}
+                    </button>
+                    <button v-if="contextMenu.item.type !== 'folder'" @click="downloadFile(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-slate-100 rounded-xl transition-colors text-sm font-bold text-slate-700">
+                        <i data-lucide="download" class="w-4 h-4"></i> ダウンロード
+                    </button>
+                    <div class="h-px bg-slate-100 my-1"></div>
+                    <button @click="moveToTrash(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-rose-50 rounded-xl transition-colors text-sm font-bold text-rose-500">
+                        <i data-lucide="trash-2" class="w-4 h-4"></i> ゴミ箱へ
+                    </button>
+                </template>
+                <!-- ゴミ箱の中にいる場合 -->
+                <template v-else>
+                    <button @click="restoreFromTrash(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-slate-100 rounded-xl transition-colors text-sm font-bold text-slate-700">
+                        <i data-lucide="rotate-ccw" class="w-4 h-4"></i> 元に戻す
+                    </button>
+                    <div class="h-px bg-slate-100 my-1"></div>
+                    <button @click="permanentlyDelete(contextMenu.item)" class="w-full flex items-center gap-3 p-3 hover:bg-rose-600 hover:text-white rounded-xl transition-colors text-sm font-bold text-rose-600">
+                        <i data-lucide="alert-triangle" class="w-4 h-4"></i> 完全に削除
+                    </button>
+                </template>
             </template>
             <template v-else>
                 <button @click="createFolderPrompt" class="w-full flex items-center gap-3 p-3 hover:bg-slate-100 rounded-xl transition-colors text-sm font-bold text-slate-700">
@@ -517,7 +530,7 @@
                                           .sort((a,b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
                         loading.value = false;
                         nextTick(() => lucide.createIcons());
-                    });
+                    }, (err) => console.error("Firestore Error:", err));
                 }
 
                 watch(currentFolder, (newVal) => {
@@ -626,6 +639,7 @@
                                 size: file.size,
                                 type: file.type || 'application/octet-stream',
                                 url: "",
+                                public_id: "", // Cloudinary ID for deletion
                                 parentId: currentFolder.value?.id || null,
                                 is_deleted: false,
                                 is_starred: false,
@@ -641,8 +655,14 @@
                             const result = await res.json();
                             
                             const itemRef = doc(db, 'artifacts', APP_ID, 'public', 'data', 'items', docRef.id);
-                            await updateDoc(itemRef, { url: result.secure_url, processing: false });
-                        } catch (err) {}
+                            await updateDoc(itemRef, { 
+                                url: result.secure_url, 
+                                public_id: result.public_id,
+                                processing: false 
+                            });
+                        } catch (err) {
+                            console.error("Upload Error:", err);
+                        }
                     }
                     statusMessage.value = "";
                 };
@@ -657,6 +677,49 @@
                     closeContextMenu();
                     const ref = doc(db, 'artifacts', APP_ID, 'public', 'data', 'items', item.id);
                     await updateDoc(ref, { is_deleted: true });
+                    previewItem.value = null;
+                };
+
+                const restoreFromTrash = async (item) => {
+                    closeContextMenu();
+                    const ref = doc(db, 'artifacts', APP_ID, 'public', 'data', 'items', item.id);
+                    await updateDoc(ref, { is_deleted: false });
+                };
+
+                const permanentlyDelete = async (item) => {
+                    closeContextMenu();
+                    const confirmMsg = item.type === 'folder' 
+                        ? `フォルダ「${item.name}」を完全に削除しますか？中身は消えませんが、アクセスできなくなります。`
+                        : `「${item.name}」を完全に削除します。この操作は取り消せません。`;
+                    
+                    if (!confirm(confirmMsg)) return;
+
+                    statusMessage.value = "DELETING...";
+                    try {
+                        // 1. Cloudinaryからの削除 (ファイルの場合のみ)
+                        if (item.type !== 'folder' && item.public_id) {
+                            // フロントエンドからの直接削除はCloudinaryの制限がある場合が多いが、一応実行。
+                            // 失敗してもFirestore側は消す。
+                            try {
+                                const formData = new FormData();
+                                formData.append('public_id', item.public_id);
+                                formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+                                await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/delete_by_token`, { 
+                                    method: 'POST', 
+                                    body: formData 
+                                });
+                            } catch (e) {
+                                console.warn("Cloudinary delete failed, skipping to Firestore delete.");
+                            }
+                        }
+
+                        // 2. Firestoreからの削除
+                        const ref = doc(db, 'artifacts', APP_ID, 'public', 'data', 'items', item.id);
+                        await deleteDoc(ref);
+                    } catch (err) {
+                        console.error("Delete Error:", err);
+                    }
+                    statusMessage.value = "";
                     previewItem.value = null;
                 };
 
@@ -683,7 +746,7 @@
                     triggerUpload, createFolderPrompt, confirmCreateFolder, handleFileUpload, handleItemClick,
                     isImage: (t) => t?.startsWith('image/'),
                     formatSize: (b) => b ? (b/1024/1024).toFixed(1) + ' MB' : '0 B',
-                    downloadFile, toggleStar, moveToTrash,
+                    downloadFile, toggleStar, moveToTrash, restoreFromTrash, permanentlyDelete,
                     getStyle: (t) => {
                         if (t?.includes('pdf')) return { bg: 'bg-rose-100', text: 'text-rose-600', icon: 'file-text' };
                         if (t?.includes('zip')) return { bg: 'bg-amber-100', text: 'text-amber-600', icon: 'archive' };
